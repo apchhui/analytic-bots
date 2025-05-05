@@ -1,20 +1,33 @@
 const mineflayer = require('mineflayer')
 const axios = require('axios')
-const webInv = require('mineflayer-web-inventory')
 const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 
-const botUsername = 'beliberdanka'
+// node main.js beliberdanka 30
+function saveItemDebug(item, index = 0) {
+    const filePath = `mfdata/debug_item_${index}.json`
+    fs.writeFileSync(filePath, JSON.stringify(item, null, 2), 'utf-8')
+    // console.log(`📄 Предмет сохранён в ${filePath}`)
+}
+
+const username = process.argv[2]
+const categorySlot = parseInt(process.argv[3], 10)
+const anarchy = parseInt(process.argv[4], 10)
+
+if (!username || isNaN(categorySlot) || isNaN(anarchy)) {
+    console.error('❌ Использование: node main.js <ник> <номер_слота> <анка>')
+    process.exit(1)
+}
+
+
 const host = 'play.funtime.su'
 
 bot = mineflayer.createBot({
     host: host,
-    username: botUsername,
+    username: username,
     version: '1.18'
 })
-
-webInv(bot)
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -40,13 +53,13 @@ bot.on('message', async function (message) {
 
 bot.once('spawn', async function() {
     console.log(`Бот ${bot.username} успешно присоединился к серверу!`)
-    bot.chat('/an222')
+    bot.chat(`/an${anarchy}`)
     await sleep(11000);
     bot.chat('/ah')
 })
 
 const hashesDir = path.join(__dirname, 'hashes')
-const hashFilePath = path.join(hashesDir, `${botUsername}_${host.replace(/\W/g, '_')}.txt`)
+const hashFilePath = path.join(hashesDir, `${username}_${host.replace(/\W/g, '_')}.txt`)
 const sentItems = new Set()
 
 if (!fs.existsSync(hashesDir)) fs.mkdirSync(hashesDir)
@@ -70,9 +83,10 @@ function hashItem(item) {
 let auctionOpened = false
 let categorySelected = false
 
+let waklState = true
+
 bot.on('windowOpen', async function (window) {
     const title = window.title
-    console.log(title)
 
     if (!auctionOpened && title.includes('Аукционы')) {
         auctionOpened = true
@@ -81,7 +95,7 @@ bot.on('windowOpen', async function (window) {
         return
     } else if (!categorySelected && title.includes('Выбор категории')) {
         categorySelected = true
-        await bot.simpleClick.leftMouse(30)
+        await bot.simpleClick.leftMouse(categorySlot)
         console.log('✅ Выбрана категория')
         return
     }
@@ -118,7 +132,7 @@ bot.on('windowOpen', async function (window) {
                 const name = item.name
                 const count = item.count
                 const numericPrice = parseInt(price.replace(/[^0-9]/g, ''), 10)
-                console.log(`[DEBUG] ${name}, ${count}, ${seller}, ${numericPrice}`)
+                // console.log(`[DEBUG] ${name}, ${count}, ${seller}, ${numericPrice}`)
 
                 const itemHash = hashItem({
                     name,
@@ -126,8 +140,8 @@ bot.on('windowOpen', async function (window) {
                     seller,
                     price: numericPrice
                 })
-                console.log(`[DEBUG HASH] ${itemHash} — уже был? ${sentItems.has(itemHash)}`)
-
+                // console.log(`[DEBUG HASH] ${itemHash} — уже был? ${sentItems.has(itemHash)}`)
+                saveItemDebug(item, i)
                 if (sentItems.has(itemHash)) {
                     continue
                 }
@@ -142,12 +156,25 @@ bot.on('windowOpen', async function (window) {
                         seller: seller,
                         price: numericPrice
                     })
-                    console.log(`✅ Отправлен новый предмет: ${name}`)
+                    // console.log(`✅ Отправлен новый предмет: ${name}`)
                 } catch (err) {
                     console.log(`❌ Ошибка при отправке ${name}: ${err}`)
                 }
             }
         }
+        categorySelected = false
+        auctionOpened = false
+        bot.closeWindow(window)
+        if(waklState == true) { bot.setControlState('forward', true);
+            waklState = false
+        } else if (waklState == false) {bot.setControlState('back', true);
+            waklState = true
+        }
+        await sleep(10000)
+        bot.clearControlStates()
+        bot.chat('/ah')
+        const used = process.memoryUsage();
+        console.log(`[MEMORY] Heap: ${(used.heapUsed / 1024 / 1024).toFixed(2)} MB / ${(used.heapTotal / 1024 / 1024).toFixed(2)} MB`);
     }
 })
 
