@@ -1,6 +1,9 @@
 from fastapi import FastAPI
+from fastapi import Request
+from fastapi import Query
+from fastapi import APIRouter
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timedelta, timezone
 import psycopg2
 import re
@@ -8,9 +11,25 @@ import threading
 import time
 from fastapi.responses import JSONResponse
 import subprocess
+import asyncio
+import os
 
-usernames = ['beliberdanka']
-slots = []
+usernames = [
+    'beliberdanka'
+]
+
+# , 'beliberdanok', 'beliberdanische', 'beliberdanchik',
+#     'beliberdanus', 'belibErdan4ik', 'beliberdanoid'
+
+slots = [12, 13, 14, 15, 20, 21, 22, 23, 24, 29, 30, 31, 32, 33]
+anarchy = [
+    102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+    203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230,
+    302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+    502, 503, 504, 505, 506, 507, 508, 509, 510,
+    602, 603, 604, 605
+]
+
 
 app = FastAPI()
 
@@ -42,19 +61,44 @@ cursor.execute("""
 """)
 
 cursor.execute("""
+    CREATE TABLE IF NOT EXISTS formatted_items (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMPTZ NOT NULL,
+        item TEXT UNIQUE,
+        median INT,
+        allCount INT,
+        midPrice INT,
+        TheMostPrice INT,
+        TheMostSeller TEXT
+    )
+""")
+
+cursor.execute("""
     CREATE TABLE IF NOT EXISTS items (
         id SERIAL PRIMARY KEY,
         timestamp TIMESTAMPTZ DEFAULT now(),
         item TEXT,
         count INTEGER,
         price REAL,
-        seller TEXT
+        seller TEXT,
+        name TEXT,
+        rname TEXT
     )
 """)
 
 conn.commit()
 
 JS_PATH = '/home/apchhui/workspace/funtime/bot/main.js'
+
+
+class ResultsRequest(BaseModel):
+    timestamp: datetime | None = None
+    item: str
+    median: int
+    allCount: int
+    midPrice: int
+    TheMostPrice: int
+    TheMostSeller: str
 
 class MessageRequest(BaseModel):
     text: str
@@ -65,10 +109,13 @@ class SearchRequest(BaseModel):
     nickname: Optional[str] = None
 
 class StatRequest(BaseModel):
-    item: str
-    count: int
-    seller: Optional[str]
-    price: float
+    item: Optional[str] = None
+    count: Optional[int] = None
+    price: Optional[int] = None
+    seller: Optional[str] = None
+    name: Optional[str] = None
+    rname: Optional[str] = None
+
 
 def parse_message(text):
     result = {'clan': None, 'privilege': None, 'nickname': None, 'suffix': None}
@@ -116,7 +163,6 @@ async def save_message(request: MessageRequest):
         return {"status": "error", "msg": "Invalid message format. Expected ⇨ separator."}
 
     data = parse_message(raw_prefix)
-    print(data)
     nickname = data['nickname']
     clan = data['clan']
     privilege = data['privilege']
@@ -176,31 +222,112 @@ async def search_messages(req: SearchRequest):
 async def stat(request: StatRequest):
     try:
         cursor.execute("""
-            INSERT INTO items (timestamp, item, count, price, seller)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (datetime.now(timezone.utc), request.item, request.count, request.price, request.seller))
+            INSERT INTO items (timestamp, item, count, price, seller, name, rname)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            datetime.now(timezone.utc),
+            request.item,
+            request.count,
+            request.price,
+            request.seller,
+            request.name,
+            request.rname
+        ))
         conn.commit()
     except Exception as e:
         print(f'[ERROR] {e}')
         return {'status': 400}
     return {'status': 200}
 
-@app.get("/item/")
-async def data():
-    cursor.execute("SELECT * FROM items")
-    rows = cursor.fetchall()
-    data = [
-        {   
-            "id": row[0],
-            "timestamp": row[1].isoformat(),
-            "item": row[2],
-            "count": row[3],
-            "price": row[4],
-            "seller": row[5]
-        } for row in rows
-    ]
-    return JSONResponse(content=data)
+@app.get('/item/')
+async def items():
+    try:
+        cursor.execute('SELECT * FROM items')
+        data = cursor.fetchall()
+        return {'status': 200, 'data': data}
+    except Exception as e:
+        print(f'An error occured {e}')
+        return {'status': 429}
+
+@app.post("/results/")
+async def insert_bulk_results(results: List[ResultsRequest]):
+    try:
+        for r in results:
+            cursor.execute("""
+                INSERT INTO formatted_items (timestamp, item, median, allCount, midPrice, TheMostPrice, TheMostSeller)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (item) DO UPDATE SET
+                    timestamp = EXCLUDED.timestamp,
+                    median = EXCLUDED.median,
+                    allCount = EXCLUDED.allCount,
+                    midPrice = EXCLUDED.midPrice,
+                    TheMostPrice = EXCLUDED.TheMostPrice,
+                    TheMostSeller = EXCLUDED.TheMostSeller
+            """, (
+                r.timestamp or datetime.now(timezone.utc),
+                r.item,
+                r.median,
+                r.allCount,
+                r.midPrice,
+                r.TheMostPrice,
+                r.TheMostSeller
+            ))
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        conn.rollback()  # <- обязательно
+        print(f"[ERROR] /results/: {e}")
+        return {"status": "error", "detail": str(e)}
 
 @app.get('/start/')
 async def start():
-    return 'Боты запущены(aga)'
+    processes = []
+    js_dir = os.path.dirname(JS_PATH)
+
+    for i, nick in enumerate(usernames):
+        proc = subprocess.Popen(
+            ['node', JS_PATH, nick, str(slots[i]), str(anarchy[i])],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=js_dir
+        )
+        processes.append((nick, proc))
+
+    async def read_output(nick, proc):
+        while True:
+            line = await asyncio.to_thread(proc.stdout.readline)
+            if not line:
+                break
+            print(f"[{nick}] {line.strip()}")
+
+    for nick, proc in processes:
+        asyncio.create_task(read_output(nick, proc))
+
+    return 'Боты запущены'
+
+@app.get('/items/')
+async def get_filtered_items(
+    item: Optional[str] = Query(None),
+    seller: Optional[str] = Query(None)
+):
+    try:
+        query = "SELECT * FROM formatted_items"
+        params = []
+
+        if item and seller:
+            query += " WHERE item = %s AND seller = %s"
+            params.extend([item, seller])
+        elif item:
+            query += " WHERE item = %s"
+            params.append(item)
+        elif seller:
+            query += " WHERE seller = %s"
+            params.append(seller)
+
+        cursor.execute(query, tuple(params))
+        data = cursor.fetchall()
+        return {'status': 200, 'data': data}
+    except Exception as e:
+        print(f'An error occurred: {e}')
+        return {'status': 500, 'error': str(e)}
