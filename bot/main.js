@@ -1,183 +1,333 @@
-const mineflayer = require('mineflayer')
-const axios = require('axios')
-const crypto = require('crypto')
-const fs = require('fs')
-const path = require('path')
+from fastapi import FastAPI
+from fastapi import Request
+from fastapi import Query
+from fastapi import APIRouter
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime, timedelta, timezone
+import psycopg2
+import re
+import threading
+import time
+from fastapi.responses import JSONResponse
+import subprocess
+import asyncio
+import os
 
-// node main.js beliberdanka 30
-function saveItemDebug(item, index = 0) {
-    const filePath = `mfdata/debug_item_${index}.json`
-    fs.writeFileSync(filePath, JSON.stringify(item, null, 2), 'utf-8')
-    // console.log(`📄 Предмет сохранён в ${filePath}`)
-}
+usernames = [
+    'beliberdanka'
+]
 
-const username = process.argv[2]
-const categorySlot = parseInt(process.argv[3], 10)
-const anarchy = parseInt(process.argv[4], 10)
+# , 'beliberdanok', 'beliberdanische', 'beliberdanchik',
+#     'beliberdanus', 'belibErdan4ik', 'beliberdanoid'
 
-if (!username || isNaN(categorySlot) || isNaN(anarchy)) {
-    console.error('❌ Использование: node main.js <ник> <номер_слота> <анка>')
-    process.exit(1)
-}
+slots = [12, 13, 14, 15, 20, 21, 22, 23, 24, 29, 30, 31, 32, 33]
+anarchy = [
+    102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+    203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230,
+    302, 303, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315, 316, 317,
+    502, 503, 504, 505, 506, 507, 508, 509, 510,
+    602, 603, 604, 605
+]
 
 
-const host = 'play.funtime.su'
+app = FastAPI()
 
-bot = mineflayer.createBot({
-    host: host,
-    username: username,
-    version: '1.18'
-})
+conn = psycopg2.connect(
+    dbname="datametry",
+    user="apchhui",
+    password="1337",
+    host="localhost"
+)
+cursor = conn.cursor()
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS players (
+        id SERIAL PRIMARY KEY,
+        nickname TEXT UNIQUE,
+        privilege TEXT,
+        clan TEXT,
+        suffix TEXT
+    )
+""")
 
-async function sendToAPI(data, point) {
-    try {
-        await axios.post(`http://localhost:8000/${point}/`, {
-            text: data
-        })
-        console.log('✅ Сообщение отправлено в FastAPI:', data)
-    } catch (err) {
-        console.error('❌ Ошибка при отправке в FastAPI:', err.message)
-    }
-}
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        player_id INTEGER REFERENCES players(id) ON DELETE CASCADE,
+        message TEXT,
+        timestamp TIMESTAMPTZ DEFAULT now()
+    )
+""")
 
-bot.on('message', async function (message) {
-    const msg = message.toString()
-    if (msg.includes('⇨')) {
-        await sendToAPI(msg, 'message')
-    }
-})
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS formatted_items (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMPTZ NOT NULL,
+        item TEXT UNIQUE,
+        median INT,
+        allCount INT,
+        midPrice INT,
+        TheMostPrice INT,
+        TheMostSeller TEXT
+    )
+""")
 
-bot.once('spawn', async function() {
-    console.log(`Бот ${bot.username} успешно присоединился к серверу!`)
-    bot.chat(`/an${anarchy}`)
-    await sleep(11000);
-    bot.chat('/ah')
-})
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS items (
+        id SERIAL PRIMARY KEY,
+        timestamp TIMESTAMPTZ DEFAULT now(),
+        item TEXT,
+        count INTEGER,
+        price REAL,
+        seller TEXT,
+        name TEXT,
+        rname TEXT
+    )
+""")
 
-const hashesDir = path.join(__dirname, 'hashes')
-const hashFilePath = path.join(hashesDir, `${username}_${host.replace(/\W/g, '_')}.txt`)
-const sentItems = new Set()
+conn.commit()
 
-if (!fs.existsSync(hashesDir)) fs.mkdirSync(hashesDir)
-if (fs.existsSync(hashFilePath)) {
-    const lines = fs.readFileSync(hashFilePath, 'utf-8').split('\n').filter(Boolean)
-    for (const line of lines) {
-        sentItems.add(line)
-    }
-    console.log(`🔄 Загружено ${sentItems.size} ранее отправленных предметов.`)
-}
+JS_PATH = '/home/apchhui/workspace/funtime/bot/main.js'
 
-function saveHash(hash) {
-    fs.appendFileSync(hashFilePath, hash + '\n')
-}
 
-function hashItem(item) {
-    const str = `${item.name}-${item.count}-${item.seller}-${item.price}`
-    return crypto.createHash('sha256').update(str).digest('hex')
-}
+class ResultsRequest(BaseModel):
+    timestamp: datetime | None = None
+    item: str
+    median: int
+    allCount: int
+    midPrice: int
+    TheMostPrice: int
+    TheMostSeller: str
 
-let auctionOpened = false
-let categorySelected = false
+class MessageRequest(BaseModel):
+    text: str
 
-let waklState = true
+class SearchRequest(BaseModel):
+    search_term: str
+    seconds: int = 3600
+    nickname: Optional[str] = None
 
-bot.on('windowOpen', async function (window) {
-    const title = window.title
+class StatRequest(BaseModel):
+    item: Optional[str] = None
+    count: Optional[int] = None
+    price: Optional[int] = None
+    seller: Optional[str] = None
+    name: Optional[str] = None
+    rname: Optional[str] = None
 
-    if (!auctionOpened && title.includes('Аукционы')) {
-        auctionOpened = true
-        await bot.simpleClick.leftMouse(52)
-        console.log('✅ Открыт раздел аукциона')
-        return
-    } else if (!categorySelected && title.includes('Выбор категории')) {
-        categorySelected = true
-        await bot.simpleClick.leftMouse(categorySlot)
-        console.log('✅ Выбрана категория')
-        return
-    }
 
-    if (categorySelected && auctionOpened) {
-        for (let i = 0; i < 45; i++) {
-            const item = window.slots[i];
-            if (item) {
-                const nbt = item.nbt
-                if (!nbt) continue;
+def parse_message(text):
+    result = {'clan': None, 'privilege': None, 'nickname': None, 'suffix': None}
 
-                const loreTag = nbt.value?.display?.value?.Lore?.value?.value
-                if (!Array.isArray(loreTag)) continue;
+    text = re.sub(r'^[^\w<\[{]+', '', text).strip()
 
-                let seller = ''
-                let price = ''
+    pattern = re.compile(
+        r'^(?:<(?P<clan>[^<>]+)>\s*)?'
+        r'(?:\[(?P<priv1>[^\[\]]+)\]|\{(?P<priv2>[^\{\}]+)\})\s+'
+        r'(?P<nickname>\S+)'
+        r'(?:\s+(?P<suffix>.+))?$'
+    )
 
-                for (const jsonStr of loreTag) {
-                    const msg = JSON.parse(jsonStr)
+    match = pattern.match(text)
+    if match:
+        result['clan'] = match.group('clan')
+        result['privilege'] = match.group('priv1') or match.group('priv2')
+        result['nickname'] = match.group('nickname')
+        result['suffix'] = match.group('suffix')
 
-                    if (msg.extra) {
-                        const fullText = msg.extra.map(e => e.text).join('')
+    return result
 
-                        if (fullText.includes('Прoдaвeц:')) {
-                            seller = msg.extra[msg.extra.length - 1].text.trim()
-                        }
 
-                        if (fullText.includes('Ценa')) {
-                            price = msg.extra[msg.extra.length - 1].text.trim()
-                        }
-                    }
-                }
+def auto_cleanup_old_messages(interval_seconds=60):
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            cutoff = now_utc - timedelta(days=3)
+            cursor.execute("DELETE FROM messages WHERE timestamp < %s", (cutoff,))
+            conn.commit()
+            print(f"[{now_utc}] Старые сообщения удалены до {cutoff}")
+        except Exception as e:
+            print(f"[!] Ошибка при удалении: {e}")
+        time.sleep(interval_seconds)
 
-                const name = item.name
-                const count = item.count
-                const numericPrice = parseInt(price.replace(/[^0-9]/g, ''), 10)
-                // console.log(`[DEBUG] ${name}, ${count}, ${seller}, ${numericPrice}`)
+thread = threading.Thread(target=auto_cleanup_old_messages, daemon=True)
+thread.start()
 
-                const itemHash = hashItem({
-                    name,
-                    count,
-                    seller,
-                    price: numericPrice
-                })
-                // console.log(`[DEBUG HASH] ${itemHash} — уже был? ${sentItems.has(itemHash)}`)
-                saveItemDebug(item, i)
-                if (sentItems.has(itemHash)) {
-                    continue
-                }
+@app.post("/message/")
+async def save_message(request: MessageRequest):
+    timestamp = datetime.now(timezone.utc)
+    try:
+        raw_prefix, text = request.text.split('⇨', 1)
+    except ValueError:
+        return {"status": "error", "msg": "Invalid message format. Expected ⇨ separator."}
 
-                sentItems.add(itemHash)
-                saveHash(itemHash)
+    data = parse_message(raw_prefix)
+    nickname = data['nickname']
+    clan = data['clan']
+    privilege = data['privilege']
+    suffix = data['suffix']
 
-                try {
-                    await axios.post('http://localhost:8000/item/', {
-                        item: name,
-                        count: count,
-                        seller: seller,
-                        price: numericPrice
-                    })
-                    // console.log(`✅ Отправлен новый предмет: ${name}`)
-                } catch (err) {
-                    console.log(`❌ Ошибка при отправке ${name}: ${err}`)
-                }
-            }
-        }
-        categorySelected = false
-        auctionOpened = false
-        bot.closeWindow(window)
-        if(waklState == true) { bot.setControlState('forward', true);
-            waklState = false
-        } else if (waklState == false) {bot.setControlState('back', true);
-            waklState = true
-        }
-        await sleep(10000)
-        bot.clearControlStates()
-        bot.chat('/ah')
-        const used = process.memoryUsage();
-        console.log(`[MEMORY] Heap: ${(used.heapUsed / 1024 / 1024).toFixed(2)} MB / ${(used.heapTotal / 1024 / 1024).toFixed(2)} MB`);
-    }
-})
+    cursor.execute("""
+        INSERT INTO players (nickname, privilege, clan, suffix)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (nickname) DO UPDATE SET
+            privilege = EXCLUDED.privilege,
+            clan = EXCLUDED.clan,
+            suffix = EXCLUDED.suffix
+        RETURNING id
+    """, (nickname, privilege, clan, suffix))
 
-bot.on('disconnect', function (packet) {
-    console.log('disconnected: ' + packet.reason)
-})
+    player_id = cursor.fetchone()[0]
+
+    cursor.execute("""
+        INSERT INTO messages (player_id, message, timestamp)
+        VALUES (%s, %s, %s)
+    """, (player_id, text.strip(), timestamp))
+
+    conn.commit()
+
+    return {"status": "saved", "msg": text.strip()}
+
+@app.post("/search/")
+async def search_messages(req: SearchRequest):
+    time_threshold = datetime.now(timezone.utc) - timedelta(seconds=req.seconds)
+    if len(req.search_term) > 100:
+        return {"error": "Search term too long"}
+    pattern = f"%{req.search_term.lower()}%"
+
+    if req.nickname:
+        cursor.execute("""
+            SELECT m.timestamp, p.nickname, m.message FROM messages m
+            JOIN players p ON m.player_id = p.id
+            WHERE m.timestamp >= %s AND p.nickname = %s AND LOWER(m.message) LIKE %s
+            ORDER BY m.timestamp ASC
+        """, (time_threshold, req.nickname, pattern))
+    else:
+        cursor.execute("""
+            SELECT m.timestamp, p.nickname, m.message FROM messages m
+            JOIN players p ON m.player_id = p.id
+            WHERE m.timestamp >= %s AND LOWER(m.message) LIKE %s
+            ORDER BY m.timestamp ASC
+        """, (time_threshold, pattern))
+
+    result = cursor.fetchall()
+    messages = [
+        f"[{ts.astimezone().strftime('%Y-%m-%d %H:%M:%S')}] {nick}: {msg}"
+        for ts, nick, msg in result
+    ]
+    return {"matches": messages, "count": len(messages)}
+
+@app.post("/item/")
+async def stat(request: StatRequest):
+    try:
+        cursor.execute("""
+            INSERT INTO items (timestamp, item, count, price, seller, name, rname)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            datetime.now(timezone.utc),
+            request.item,
+            request.count,
+            request.price,
+            request.seller,
+            request.name,
+            request.rname
+        ))
+        conn.commit()
+    except Exception as e:
+        print(f'[ERROR] {e}')
+        return {'status': 400}
+    return {'status': 200}
+
+@app.get('/item/')
+async def items():
+    try:
+        cursor.execute('SELECT * FROM items')
+        data = cursor.fetchall()
+        return {'status': 200, 'data': data}
+    except Exception as e:
+        print(f'An error occured {e}')
+        return {'status': 429}
+
+@app.post("/results/")
+async def insert_bulk_results(results: List[ResultsRequest]):
+    try:
+        for r in results:
+            cursor.execute("""
+                INSERT INTO formatted_items (timestamp, item, median, allCount, midPrice, TheMostPrice, TheMostSeller)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (item) DO UPDATE SET
+                    timestamp = EXCLUDED.timestamp,
+                    median = EXCLUDED.median,
+                    allCount = EXCLUDED.allCount,
+                    midPrice = EXCLUDED.midPrice,
+                    TheMostPrice = EXCLUDED.TheMostPrice,
+                    TheMostSeller = EXCLUDED.TheMostSeller
+            """, (
+                r.timestamp or datetime.now(timezone.utc),
+                r.item,
+                r.median,
+                r.allCount,
+                r.midPrice,
+                r.TheMostPrice,
+                r.TheMostSeller
+            ))
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        conn.rollback()  # <- обязательно
+        print(f"[ERROR] /results/: {e}")
+        return {"status": "error", "detail": str(e)}
+
+@app.get('/start/')
+async def start():
+    processes = []
+    js_dir = os.path.dirname(JS_PATH)
+
+    for i, nick in enumerate(usernames):
+        proc = subprocess.Popen(
+            ['node', JS_PATH, nick, str(slots[i]), str(anarchy[i])],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=js_dir
+        )
+        processes.append((nick, proc))
+
+    async def read_output(nick, proc):
+        while True:
+            line = await asyncio.to_thread(proc.stdout.readline)
+            if not line:
+                break
+            print(f"[{nick}] {line.strip()}")
+
+    for nick, proc in processes:
+        asyncio.create_task(read_output(nick, proc))
+
+    return 'Боты запущены'
+
+@app.get('/items/')
+async def get_filtered_items(
+    item: Optional[str] = Query(None),
+    seller: Optional[str] = Query(None)
+):
+    try:
+        query = "SELECT * FROM formatted_items"
+        params = []
+
+        if item and seller:
+            query += " WHERE item = %s AND seller = %s"
+            params.extend([item, seller])
+        elif item:
+            query += " WHERE item = %s"
+            params.append(item)
+        elif seller:
+            query += " WHERE seller = %s"
+            params.append(seller)
+
+        cursor.execute(query, tuple(params))
+        data = cursor.fetchall()
+        return {'status': 200, 'data': data}
+    except Exception as e:
+        print(f'An error occurred: {e}')
+        return {'status': 500, 'error': str(e)}
