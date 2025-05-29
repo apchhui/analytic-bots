@@ -1,255 +1,296 @@
-const EventEmitter = require('events');
-const sharp = require('sharp');
-const colorMap = require('./utils/captcha/colors.json');
+const mineflayer = require('mineflayer')
+const mineflayerViewer = require('prismarine-viewer').mineflayer
+const axios = require('axios')
+const crypto = require('crypto')
+const fs = require('fs')
+const path = require('path')
+const Vec3 = require('vec3')
+const colorMap = require('./utils/captcha/colors.json')
+const FlayerCaptcha = require('flayercaptcha');
+const { getValueFromType } = require('three/src/nodes/core/NodeUtils.js')
 
-class FlayerCaptcha extends EventEmitter {
-    constructor(bot, options = {}) {
-        super();
-        this.bot = bot;
-        this.isStopped = options.isStopped || false;
-        this.minCardsToRender = options.minCardsToRender || 6;
-        this.expectedMapIds = new Set();
-        this.pendingMapData = new Map(); // Buffer for pending map data
-        this.initializations();
+function saveItemDebug(item, index = 0) {
+    const filePath = `mfdata/debug_item_${index}.json`
+    fs.writeFileSync(filePath, JSON.stringify(item, null, 2), 'utf-8')
+}
 
-        this.yaws = { "2": '1', "3": '2', "5": '3', "0": '4' };
+const username = process.argv[2]
+const categorySlot = parseInt(process.argv[3], 10)
+const anarchy = parseInt(process.argv[4], 10)
+
+if (!username || isNaN(categorySlot) || isNaN(anarchy)) {
+    console.error('❌ Использование: node main.js <ник> <номер_слота> <анка>')
+    process.exit(1)
+}
+
+const host = 'play.funtime.su'
+
+const bot = mineflayer.createBot({
+    host: host,
+    username: username,
+    version: '1.18'
+})
+
+const directions = new Map([
+  ['3 2', 'up'],
+  ['3 -2', 'down'],
+  ['3 0', 'south'],
+  ['2 0', 'west'],
+  ['0 0', 'north'],
+  ['5 0', 'east']
+]);
+
+function getViewDirection(yaw, pitch) {
+  const key = `${Math.round(yaw)} ${Math.round(pitch)}`;
+  return directions.get(key);
+}
+
+let BotViewDirection = null;
+let ReserveBotDirection = null;
+let saved = false;
+
+const captcha = new FlayerCaptcha(bot);
+
+captcha.on('success', async (imageSharp, viewDirection) => {
+  while (BotViewDirection === null || ReserveBotDirection === null) {
+    await sleep(10);
+  }
+
+  if (saved) return;
+
+  if (viewDirection === ReserveBotDirection) {
+    const filePath = `maps/captcha/captcha_${bot.username}.png`;
+    try {
+      await imageSharp.toFile(filePath);
+      console.log(`✔ Saved correct CAPTCHA at ${filePath}`);
+      saved = true;
+    } catch (err) {
+      console.error('❌ Error saving image:', err);
     }
+  } else {
+    console.log(`✘ Ignored CAPTCHA (direction ${viewDirection} ≠ target)`);
+  }
+});
 
-    stop() { this.updateState(true); }
-    resume() { this.updateState(false); }
+bot.once('login', async () => {
+  mineflayerViewer(bot, { port: 3000 });
 
-    updateState(isStopped) {
-        if (this.isStopped !== isStopped) {
-            this.isStopped = isStopped;
-            this.setDefaultSettings();
-        }
-    }
+  await sleep(3000);
 
-    getForwardVector() {
-        const yaw = this.bot.entity.yaw;
-        return {
-            x: -Math.sin(yaw),
-            y: 0,
-            z: -Math.cos(yaw)
-        };
-    }
+  const yaw = bot.entity.yaw;
+  const pitch = bot.entity.pitch;
 
-    setDefaultSettings() {
-        this.img = {
-            maps: new Map(),
-            images: [],
-            x: [], y: [], z: [],
-            yaw: null,
-            count: 0
-        };
-        this.keys = this.getCorrectKeys();
-        this.expectedMapIds.clear();
-        this.pendingMapData.clear();
-    }
+  const mainDir = getViewDirection(yaw, pitch);
+  if (!mainDir) {
+    console.warn(`⚠ Не удалось определить направление бота (Yaw: ${yaw}, Pitch: ${pitch})`);
+    return;
+  }
 
-    isNotSupportedVersion() {
-        if (this.bot.registry.version['<=']('1.13.1') || this.bot.registry.version['>=']('1.20.5')) {
-            console.error(`Unsupported bot version: ${this.bot.version}`);
-            this.stop();
-        }
-    }
+  BotViewDirection = mainDir;
 
-    getCorrectKeys() {
-        if (this.bot.registry.version['<=']('1.13.2')) {
-            return { keyRotate: 7, keyItem: 6 };
-        } else if (this.bot.registry.version['<=']('1.16.5')) {
-            return { keyRotate: 8, keyItem: 7 };
-        }
-        return { keyRotate: 9, keyItem: 8 };
-    }
+  // Зеркальное направление:
+  if (mainDir === 'north') ReserveBotDirection = 'south';
+  else if (mainDir === 'south') ReserveBotDirection = 'north';
+  else if (mainDir === 'east') ReserveBotDirection = 'west';
+  else if (mainDir === 'west') ReserveBotDirection = 'east';
+  else ReserveBotDirection = mainDir; // для up/down оставить как есть
 
-    isFilledMap(itemId) {
-        return this.bot.registry.items[itemId]?.name === 'filled_map';
-    }
-
-    isFrame(entityType) {
-        const frames = new Set(['item_frame', 'item_frames', 'glow_item_frame']);
-        const entityName = this.bot.registry.entities[entityType]?.name;
-        return frames.has(entityName);
-    }
-
-    initializations() {
-        this.debugMapDistances = [];
-
-        this.bot._client.on('login', () => {
-            this.isNotSupportedVersion();
-            if (this.isStopped) return;
-            this.setDefaultSettings();
-        });
-
-        this.bot._client.on('packet', async (packet) => {
-            if (!packet || this.isStopped) return;
-
-            const { itemDamage, data, item } = packet;
-
-            if (data && typeof itemDamage === 'number') {
-                if (this.expectedMapIds.has(itemDamage)) {
-                    this.img.maps.set(itemDamage, data);
-                } else {
-                    this.pendingMapData.set(itemDamage, data);
-                }
-            } else if (this.isFilledMap(item?.itemId)) {
-                const idMap = item.nbtData ? item.nbtData.value.map.value : 0;
-                const imgBuf = await this.takeImgBuf(idMap);
-                if (!imgBuf) return;
-                this.img.images.push([{ x: 0, y: 0, z: 0 }, imgBuf, 0]);
-                this.img.count++;
-                if (this.img.count >= this.minCardsToRender) this.createCaptchaImage();
-            }
-        });
-
-        this.bot._client.on('entity_metadata', async ({ entityId, metadata }) => {
-            if (this.isStopped) return;
-
-            const entity = this.bot.entities[entityId];
-            if (!entity) return;
-
-            const { entityType, position } = entity;
-            if (!this.isFrame(entityType)) return;
-
-            const botPos = this.bot.entity.position;
-            const relative = position.offset(-botPos.x, -botPos.y, -botPos.z);
-            const dot = this.getForwardVector().dot(relative);
-
-            const distance = relative.distanceTo({ x: 0, y: 0, z: 0 });
-            if (dot < 0.5 || distance > 6) return;
-
-            const itemData = metadata.find(v => v.key === this.keys.keyItem)?.value;
-            if (!this.isFilledMap(itemData?.itemId)) return;
-
-            const idMap = itemData.nbtData.value.map.value;
-            this.expectedMapIds.add(idMap);
-
-            if (this.pendingMapData.has(idMap)) {
-                this.img.maps.set(idMap, this.pendingMapData.get(idMap));
-                this.pendingMapData.delete(idMap);
-            }
-
-            let imgBuf;
-            try {
-                imgBuf = await this.takeImgBuf(idMap);
-            } catch (e) {
-                return;
-            }
-            if (!imgBuf) return;
-
-            const rotate = metadata.find(v => v.key === this.keys.keyRotate)?.value || 0;
-            this.img.images.push([position, imgBuf, rotate]);
-            this.img.count++;
-
-            this.debugMapDistances.push({
-                idMap,
-                x: position.x.toFixed(1),
-                y: position.y.toFixed(1),
-                z: position.z.toFixed(1),
-                distance: distance.toFixed(2)
-            });
-
-            if (this.img.count >= this.minCardsToRender) {
-                this.createCaptchaImage();
-
-                console.log('\n📊 Сводка по картам:');
-                console.table(this.debugMapDistances, ['idMap', 'x', 'y', 'z', 'distance']);
-            }
-        });
-    }
+  console.log(`✔ BotViewDirection: ${BotViewDirection}, Reserve: ${ReserveBotDirection}`);
+});
 
 
-    async takeImgBuf(idMap) {
-        let imgBuf;
-        const start = Date.now();
-        const timeout = 10000; // Increased to 10s timeout
 
-        console.log(`⏳ Ожидание буфера карты ${idMap}...`);
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-        while (!imgBuf && !this.isStopped) {
-            imgBuf = this.img.maps.get(idMap);
-            if (imgBuf) break;
-            if (Date.now() - start > timeout) {
-                console.warn(`⚠️ Таймаут получения буфера карты ${idMap}`);
-                break;
-            }
-            await this.sleep(100);
-        }
-
-        return imgBuf ? this.getImgBuf(imgBuf) : null;
-    }
-
-    async createCaptchaImage() {
-        if (this.isStopped || this.img.count < this.minCardsToRender) return;
-
-        try {
-            const readImages = await Promise.all(
-                this.img.images.map(([_, imgBuf, rotate]) =>
-                    sharp(imgBuf, { raw: { width: 128, height: 128, channels: 4 } })
-                        .rotate(90 * rotate)
-                        .png()
-                        .toBuffer()
-                )
-            );
-
-            const totalWidth = 128 * readImages.length;
-            const height = 128;
-
-            const composites = readImages.map((imageBuffer, i) => ({
-                input: imageBuffer,
-                left: i * 128,
-                top: 0
-            }));
-
-            const baseImage = sharp({
-                create: {
-                    width: totalWidth,
-                    height: height,
-                    channels: 4,
-                    background: { r: 255, g: 255, b: 255, alpha: 1 }
-                }
-            }).png();
-
-            const image = baseImage.composite(composites);
-
-            this.setDefaultSettings();
-            this.emit('success', image);
-        } catch (e) {
-            console.error('❌ Ошибка при создании капчи:', e);
-        }
-    }
-
-    createCoordinateMappingAndValue(values, type = false) {
-        const sortOrder = !type && (this.img.yaw == 1 || this.img.yaw == 2) ? (a, b) => a - b : (a, b) => b - a;
-        const uniqueValues = [...new Set(values)];
-        const sortValues = uniqueValues.sort(sortOrder);
-
-        const maxValue = sortValues[0];
-        const minValue = sortValues[sortValues.length - 1];
-
-        const value = Math.abs(maxValue - minValue) + 1;
-        const mapping = new Map(sortValues.map((val, index) => [val, index * 128]));
-
-        return { mapping, value: value * 128 };
-    }
-
-    getImgBuf(buf) {
-        const imgBuf = new Uint8ClampedArray(65536);
-        const cache = new Map();
-
-        buf.forEach((color, i) => {
-            const colorArr = cache.get(color) || colorMap[color];
-            cache.set(color, colorArr);
-            imgBuf.set(colorArr, i * 4);
-        });
-
-        return imgBuf;
-    }
-
-    sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+async function sendToAPI(data, point) {
+    try {
+        await axios.post(`http://localhost:8000/${point}/`, {
+            text: data
+        })
+        console.log('✅ Сообщение отправлено в FastAPI:', data)
+    } catch (err) {
+        console.error('❌ Ошибка при отправке в FastAPI:', err.message)
     }
 }
 
-module.exports = FlayerCaptcha;
+bot.on('message', async function (message) {
+    const msg = message.toString()
+    console.log(msg)
+    if (msg.includes('⇨')) {
+        await sendToAPI(msg, 'message')
+    }
+})
+
+bot.once('spawn', async function() {
+    console.log(`Бот ${bot.username} успешно присоединился к серверу!`)
+    bot.chat(`/an${anarchy}`)
+    await sleep(11000);
+    bot.chat('/ah')
+})
+
+const hashesDir = path.join(__dirname, 'hashes')
+const hashFilePath = path.join(hashesDir, `${username}_${host.replace(/\W/g, '_')}.txt`)
+const sentItems = new Set()
+
+if (!fs.existsSync(hashesDir)) fs.mkdirSync(hashesDir)
+if (fs.existsSync(hashFilePath)) {
+    const lines = fs.readFileSync(hashFilePath, 'utf-8').split('\n').filter(Boolean)
+    for (const line of lines) {
+        sentItems.add(line)
+    }
+    console.log(`🔄 Загружено ${sentItems.size} ранее отправленных предметов.`)
+}
+
+function saveHash(hash) {
+    sentItems.add(hash)
+    const allHashes = Array.from(sentItems)
+    if (allHashes.length > 70) {
+        const lastHashes = allHashes.slice(-70)
+        fs.writeFileSync(hashFilePath, lastHashes.join('\n') + '\n', 'utf-8')
+        sentItems.clear()
+        for (const h of lastHashes) sentItems.add(h)
+    } else {
+        fs.appendFileSync(hashFilePath, hash + '\n')
+    }
+}
+
+function hashItem(item) {
+    const str = `${item.name}-${item.count}-${item.seller}-${item.price}`
+    return crypto.createHash('sha256').update(str).digest('hex')
+}
+
+let auctionOpened = false
+let categorySelected = false
+
+let waklState = true
+
+function getReadableItemName(item) {
+    try {
+        const nameJson = item?.nbt?.value?.display?.value?.Name?.value;
+        if (!nameJson) return null;
+
+        const parsed = JSON.parse(nameJson);
+
+        if (Array.isArray(parsed.extra)) {
+            return parsed.extra.map(part => part.text || '').join('');
+        } else {
+            return parsed.text || '';
+        }
+    } catch (e) {
+        console.error('Ошибка при разборе имени предмета:', e.message);
+        return null;
+    }
+}
+
+
+bot.on('windowOpen', async function (window) {
+    const title = window.title;
+
+    if (!auctionOpened && title.includes('Аукционы')) {
+        auctionOpened = true;
+        await bot.simpleClick.leftMouse(52);
+        console.log('✅ Открыт раздел аукциона');
+        return;
+    } else if (!categorySelected && title.includes('Выбор категории')) {
+        categorySelected = true;
+        await bot.simpleClick.leftMouse(categorySlot);
+        console.log('✅ Выбрана категория');
+        return;
+    }
+
+    if (categorySelected && auctionOpened) {
+        for (let i = 0; i < 45; i++) {
+            const item = window.slots[i];
+            if (item) {
+                const nbt = item.nbt;
+                if (!nbt) continue;
+
+                const loreTag = nbt.value?.display?.value?.Lore?.value?.value;
+                if (!Array.isArray(loreTag)) continue;
+
+                let seller = null;
+                let price = null;
+
+                for (const jsonStr of loreTag) {
+                    const msg = JSON.parse(jsonStr);
+
+                    if (msg.extra) {
+                        const fullText = msg.extra.map(e => e.text).join('');
+
+                        if (fullText.includes('Прoдaвeц:')) {
+                            seller = msg.extra[msg.extra.length - 1].text.trim();
+                        }
+
+                        if (fullText.includes('Ценa')) {
+                            price = msg.extra[msg.extra.length - 1].text.trim();
+                        }
+                    }
+                }
+
+                const name = item.name ?? null;
+                const count = item.count ?? null;
+                const numericPrice = price ? parseInt(price.replace(/[^0-9]/g, ''), 10) : null;
+
+                const itemHash = hashItem({
+                    name,
+                    count,
+                    seller,
+                    price: numericPrice
+                });
+
+                saveItemDebug(item, i);
+                if (sentItems.has(itemHash)) {
+                    continue;
+                }
+
+                sentItems.add(itemHash);
+                saveHash(itemHash);
+                const Iname = getReadableItemName(item);
+                try {
+                    const payload = {
+                        item: name ?? undefined,
+                        count: count ?? undefined,
+                        seller: seller ?? undefined,
+                        price: numericPrice ?? undefined,
+                        name: Iname ?? undefined,
+                        rname: item.displayName ?? undefined
+                    };
+                    
+                    await axios.post('http://localhost:8000/item/', payload);
+                } catch (err) {
+                    console.log(`❌ Ошибка при отправке ${name}: ${err}`);
+                }
+            }
+        }
+
+        categorySelected = false;
+        auctionOpened = false;
+        bot.closeWindow(window);
+        if (waklState == true) {
+            bot.setControlState('forward', true);
+            waklState = false;
+        } else {
+            bot.setControlState('back', true);
+            waklState = true;
+        }
+        await sleep(10000);
+        bot.clearControlStates();
+        console.log(username);
+        bot.chat('/ah');
+        const used = process.memoryUsage();
+        console.log(`[MEMORY] Heap: ${(used.heapUsed / 1024 / 1024).toFixed(2)} MB / ${(used.heapTotal / 1024 / 1024).toFixed(2)} MB`);
+    }
+});
+
+
+bot.on('disconnect', function () {
+    console.log('disconnected')
+    process.exit(1)
+})
+
+bot.on('kick', function () {
+    console.log('kicked')
+    process.exit(1)
+})
